@@ -94,6 +94,9 @@ type Hub struct {
 	mu        sync.Mutex
 	nodes     map[string]*nodeState // keyed by stable node ID
 	lastState []byte
+	// failing holds the IDs of tagged nodes whose last fetch failed, so a
+	// failure is only logged when a node goes from working to failing.
+	failing map[string]struct{}
 }
 
 // New creates a hub, loading persisted state and the current records file if
@@ -129,6 +132,7 @@ func New(cfg Config, peers PeerSource, fetcher ManifestFetcher, log *slog.Logger
 		log:     log,
 		now:     time.Now,
 		nodes:   map[string]*nodeState{},
+		failing: map[string]struct{}{},
 	}
 
 	if cfg.StatePath != "" {
@@ -190,24 +194,41 @@ func (h *Hub) Round(ctx context.Context) error {
 
 			addr, _ := fetchAddr(p.IPs)
 			names, err := h.fetcher.Fetch(ctx, addr)
+			h.mu.Lock()
+			defer h.mu.Unlock()
 			if err != nil {
-				h.log.Warn("fetching manifest failed", "host", p.HostName, "addr", addr, "err", err)
+				if _, already := h.failing[p.ID]; already {
+					h.log.Debug("fetching manifest still failing", "host", p.HostName, "addr", addr, "err", err)
+				} else {
+					h.failing[p.ID] = struct{}{}
+					h.log.Warn("fetching manifest failed", "host", p.HostName, "addr", addr, "err", err)
+				}
 				return
 			}
-			h.mu.Lock()
+			if _, was := h.failing[p.ID]; was {
+				delete(h.failing, p.ID)
+				h.log.Info("fetching manifest recovered", "host", p.HostName, "addr", addr)
+			}
 			h.nodes[p.ID] = &nodeState{
 				HostName: p.HostName,
 				IPs:      slices.Clone(p.IPs),
 				Names:    names,
 				LastOK:   h.now(),
 			}
-			h.mu.Unlock()
 		}()
 	}
 	wg.Wait()
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	// Forget failures of nodes that are no longer queried, so a node that
+	// comes back later is logged afresh.
+	for id := range h.failing {
+		if !slices.ContainsFunc(targets, func(p Peer) bool { return p.ID == id }) {
+			delete(h.failing, id)
+		}
+	}
 
 	h.expire()
 	if err := h.writeRecords(h.build()); err != nil {

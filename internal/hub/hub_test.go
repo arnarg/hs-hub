@@ -1,15 +1,16 @@
 package hub
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"log/slog"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -55,6 +56,7 @@ type env struct {
 	peers   *fakePeers
 	fetcher *fakeFetcher
 	clock   time.Time
+	logs    bytes.Buffer
 }
 
 func newEnv(t *testing.T) *env {
@@ -80,7 +82,7 @@ func newEnv(t *testing.T) *env {
 
 func (e *env) hub() *Hub {
 	e.t.Helper()
-	h, err := New(e.cfg, e.peers, e.fetcher, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h, err := New(e.cfg, e.peers, e.fetcher, slog.New(slog.NewTextHandler(&e.logs, nil)))
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -371,5 +373,42 @@ func TestFetchUsesIPv4(t *testing.T) {
 	}
 	if _, ok := fetchAddr(nil); ok {
 		t.Fatal("fetchAddr(nil) succeeded")
+	}
+}
+
+func TestFetchFailureLoggedOnlyOnTransition(t *testing.T) {
+	e := newEnv(t)
+	e.peers.peers = []Peer{peer("n1", "lab", "100.64.0.1", "", "tag:server")}
+	h := e.hub()
+	failures := func() int { return strings.Count(e.logs.String(), "fetching manifest failed") }
+
+	// Never served: logged once, not every round.
+	e.round(h)
+	e.round(h)
+	e.round(h)
+	if got := failures(); got != 1 {
+		t.Fatalf("failures logged = %d, want 1", got)
+	}
+
+	// Recovery is logged, and the next failure is logged again.
+	e.serve("100.64.0.1", "reader.example.com")
+	e.round(h)
+	if !strings.Contains(e.logs.String(), "fetching manifest recovered") {
+		t.Fatal("recovery not logged")
+	}
+	e.down("100.64.0.1")
+	e.round(h)
+	e.round(h)
+	if got := failures(); got != 2 {
+		t.Fatalf("failures logged = %d, want 2", got)
+	}
+
+	// Leaving and rejoining the tailnet resets the failure state.
+	e.peers.peers = nil
+	e.round(h)
+	e.peers.peers = []Peer{peer("n1", "lab", "100.64.0.1", "", "tag:server")}
+	e.round(h)
+	if got := failures(); got != 3 {
+		t.Fatalf("failures logged = %d, want 3", got)
 	}
 }
