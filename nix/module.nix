@@ -35,6 +35,7 @@ let
   ++ map (d: "-domain=${d}") cfg.domains
   ++ map (d: "-exclude-domain=${d}") (lib.unique (cfg.excludeDomains ++ magicDnsDomain))
   ++ map (n: "-reserved=${n}") cfg.reserved
+  ++ lib.optional (cfg.staticRecordsFile != null) "-static-records=${cfg.staticRecordsFile}"
   ++ cfg.extraArgs;
 in
 {
@@ -95,6 +96,19 @@ in
         DNS record pointing somewhere else, above all the Headscale server
         itself: if a node claimed it, tailnet clients would lose their
         connection to the control server.
+      '';
+    };
+
+    staticRecordsFile = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "/var/lib/headplane/dns-records.json";
+      description = ''
+        Records file, in Headscale's extra records format, merged into the
+        published records, e.g. Headplane's `headscale.dns_records_path`.
+        Its names take precedence over names claimed by nodes. It is checked
+        for changes every two seconds and must be readable by the hs-hub
+        user.
       '';
     };
 

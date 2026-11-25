@@ -49,6 +49,8 @@ func run() error {
 		path         = flag.String("manifest-path", "/services.json", "HTTP path of the manifest")
 		output       = flag.String("output", "", "records file read by Headscale (dns.extra_records_path)")
 		state        = flag.String("state", "", "optional file persisting known nodes across restarts")
+		static       = flag.String("static-records", "", "optional records file merged into the output, e.g. one managed by Headplane")
+		staticPoll   = flag.Duration("static-interval", 2*time.Second, "how often the static records file is checked for changes")
 		interval     = flag.Duration("interval", 30*time.Second, "time between rounds")
 		fetchTimeout = flag.Duration("fetch-timeout", 3*time.Second, "timeout for a single manifest fetch")
 		grace        = flag.Duration("grace", 10*time.Minute, "how long to keep names of unreachable nodes")
@@ -79,6 +81,9 @@ func run() error {
 	if *interval <= 0 {
 		return fmt.Errorf("-interval must be positive")
 	}
+	if *static != "" && *staticPoll <= 0 {
+		return fmt.Errorf("-static-interval must be positive")
+	}
 
 	h, err := hub.New(hub.Config{
 		Tag:            *tag,
@@ -89,6 +94,8 @@ func run() error {
 		Concurrency:    *concurrency,
 		OutputPath:     *output,
 		StatePath:      *state,
+
+		StaticRecordsPath: *static,
 	}, localapi.New(*socket), &hub.HTTPFetcher{
 		Port:    uint16(*port),
 		Path:    *path,
@@ -114,17 +121,43 @@ func run() error {
 
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
+
+	// The static records file is polled separately so edits show up quickly
+	// without fetching every manifest. A nil channel never fires.
+	var staticTick <-chan time.Time
+	if *static != "" {
+		t := time.NewTicker(*staticPoll)
+		defer t.Stop()
+		staticTick = t.C
+	}
+
 	for {
 		if err := h.Round(ctx); err != nil && ctx.Err() == nil {
 			log.Error("round failed", "err", err)
 		}
-		select {
-		case <-ctx.Done():
+		if !wait(ctx, log, h, ticker.C, hup, staticTick) {
 			log.Info("shutting down")
 			return nil
-		case <-ticker.C:
+		}
+	}
+}
+
+// wait blocks until the next round is due, refreshing the static records
+// whenever staticTick fires. It returns false once ctx is done.
+func wait(ctx context.Context, log *slog.Logger, h *hub.Hub, tick <-chan time.Time, hup <-chan os.Signal, staticTick <-chan time.Time) bool {
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-tick:
+			return true
 		case <-hup:
 			log.Info("SIGHUP received, running round")
+			return true
+		case <-staticTick:
+			if err := h.RefreshStatic(); err != nil {
+				log.Error("refreshing static records failed", "err", err)
+			}
 		}
 	}
 }

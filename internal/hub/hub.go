@@ -4,7 +4,8 @@
 // Every node carrying the configured tag serves a manifest over HTTP on the
 // tailnet listing the DNS names it serves. Each round the hub lists the
 // tailnet peers, fetches the manifests of the tagged ones, and writes A/AAAA
-// records pointing each name at the tailnet IPs of the node that claimed it.
+// records pointing each name at the tailnet IPs of the node that claimed it,
+// merged with the records of an optional static records file.
 package hub
 
 import (
@@ -21,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -72,6 +74,10 @@ type Config struct {
 	OutputPath string
 	// StatePath optionally persists known nodes across restarts.
 	StatePath string
+	// StaticRecordsPath optionally names a records file, in the same format
+	// as the output, whose records are merged into the output, e.g. one
+	// managed by Headplane. Its names take precedence over node claims.
+	StaticRecordsPath string
 
 	reserved map[string]struct{}
 }
@@ -97,6 +103,13 @@ type Hub struct {
 	// failing holds the IDs of tagged nodes whose last fetch failed, so a
 	// failure is only logged when a node goes from working to failing.
 	failing map[string]struct{}
+
+	// staticRaw is the last content read from the static records file and
+	// static the records of the last content that parsed.
+	staticRaw     []byte
+	staticLoaded  bool
+	static        []Record
+	staticReadErr bool
 }
 
 // New creates a hub, loading persisted state and the current records file if
@@ -231,10 +244,109 @@ func (h *Hub) Round(ctx context.Context) error {
 	}
 
 	h.expire()
+	h.loadStatic()
 	if err := h.writeRecords(h.build()); err != nil {
 		return err
 	}
 	return h.saveState()
+}
+
+// RefreshStatic rereads the static records file and, if its records changed,
+// rewrites the records file from the known nodes without fetching manifests.
+func (h *Hub) RefreshStatic() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.loadStatic() {
+		return nil
+	}
+	return h.writeRecords(h.build())
+}
+
+// loadStatic rereads the static records file and reports whether its records
+// changed. A missing file holds no records. A file that cannot be read or
+// parsed keeps the last good records, since another program may be in the
+// middle of writing it. Must be called with h.mu held.
+func (h *Hub) loadStatic() bool {
+	path := h.cfg.StaticRecordsPath
+	if path == "" {
+		return false
+	}
+	b, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		b, err = nil, nil
+	}
+	if err != nil {
+		if !h.staticReadErr {
+			h.staticReadErr = true
+			h.log.Warn("reading static records failed, keeping last good records", "path", path, "err", err)
+		}
+		return false
+	}
+	if h.staticReadErr {
+		h.staticReadErr = false
+		h.log.Info("reading static records recovered", "path", path)
+	}
+	if h.staticLoaded && bytes.Equal(b, h.staticRaw) {
+		return false
+	}
+	h.staticRaw, h.staticLoaded = b, true
+
+	recs, err := h.parseStatic(b)
+	if err != nil {
+		h.log.Warn("ignoring unparsable static records, keeping last good records", "path", path, "err", err)
+		return false
+	}
+	if slices.Equal(recs, h.static) {
+		return false
+	}
+	h.static = recs
+	h.log.Info("loaded static records", "path", path, "records", len(recs))
+	return true
+}
+
+// parseStatic decodes a records file, skipping invalid records. Empty
+// content holds no records.
+func (h *Hub) parseStatic(b []byte) ([]Record, error) {
+	if len(bytes.TrimSpace(b)) == 0 {
+		return []Record{}, nil
+	}
+	var raw []Record
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return nil, err
+	}
+	recs := []Record{}
+	for _, r := range raw {
+		name := normalizeName(r.Name)
+		typ := strings.ToUpper(strings.TrimSpace(r.Type))
+		reject := func(reason string) {
+			h.log.Warn("rejecting static record", "name", r.Name, "type", r.Type, "value", r.Value, "reason", reason)
+		}
+		if !validHostname(name) {
+			reject("invalid hostname")
+			continue
+		}
+		ip, err := netip.ParseAddr(strings.TrimSpace(r.Value))
+		switch {
+		case typ != "A" && typ != "AAAA":
+			reject("unsupported type")
+			continue
+		case err != nil || ip.Zone() != "":
+			reject("invalid address")
+			continue
+		case typ == "A" && !ip.Unmap().Is4(), typ == "AAAA" && !ip.Is6():
+			reject("address does not match type")
+			continue
+		}
+		if typ == "A" {
+			ip = ip.Unmap()
+		}
+		rec := Record{Name: name, Type: typ, Value: ip.String()}
+		if !slices.Contains(recs, rec) {
+			recs = append(recs, rec)
+		}
+	}
+	slices.SortFunc(recs, compareRecords)
+	return recs, nil
 }
 
 // fetchAddr picks the address used to reach a node, preferring IPv4.
@@ -262,16 +374,26 @@ func (h *Hub) expire() {
 	}
 }
 
-// build renders the records for all known nodes. Conflicting claims are
-// resolved by host name (then node ID) so the result is deterministic. Must
-// be called with h.mu held.
+// staticOwner is the owner logged for names taken by static records.
+const staticOwner = "static records"
+
+// build renders the static records and the records for all known nodes.
+// Static records take precedence; conflicting node claims are resolved by
+// host name (then node ID) so the result is deterministic. Must be called
+// with h.mu held.
 func (h *Hub) build() []Record {
 	ids := slices.SortedFunc(maps.Keys(h.nodes), func(a, b string) int {
 		return cmp.Or(cmp.Compare(h.nodes[a].HostName, h.nodes[b].HostName), cmp.Compare(a, b))
 	})
 
 	owner := map[string]string{}
-	recs := []Record{}
+	recs := slices.Clone(h.static)
+	if recs == nil {
+		recs = []Record{}
+	}
+	for _, r := range h.static {
+		owner[r.Name] = staticOwner
+	}
 	for _, id := range ids {
 		n := h.nodes[id]
 		for _, raw := range n.Names {
@@ -297,10 +419,12 @@ func (h *Hub) build() []Record {
 		}
 	}
 
-	slices.SortFunc(recs, func(a, b Record) int {
-		return cmp.Or(cmp.Compare(a.Name, b.Name), cmp.Compare(a.Type, b.Type), cmp.Compare(a.Value, b.Value))
-	})
+	slices.SortFunc(recs, compareRecords)
 	return recs
+}
+
+func compareRecords(a, b Record) int {
+	return cmp.Or(cmp.Compare(a.Name, b.Name), cmp.Compare(a.Type, b.Type), cmp.Compare(a.Value, b.Value))
 }
 
 func (h *Hub) writeRecords(recs []Record) error {

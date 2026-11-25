@@ -44,6 +44,31 @@ A name is published only if:
 
 Names are case-insensitive and a trailing dot is ignored.
 
+## Static records
+
+`-static-records` merges a second records file, in the same format as the output, into the published records. hs-hub only reads it, so another program, or a person, can own it. Use it for records hs-hub doesn't discover, such as LAN devices or records managed in [Headplane](https://github.com/tale/headplane).
+
+- Records must be `A` or `AAAA` with a matching IP address. Names are not limited to `-domain`, and `-reserved` and `-exclude-domain` don't apply. Invalid records are skipped and logged.
+- A name in the static file wins over any node claiming it. The conflict is logged.
+- The file is checked every `-static-interval` (default 2s), and a change rewrites the output without fetching manifests.
+- A missing file holds no records. A file that can't be read or parsed (for example one caught halfway through a write) keeps its last good records.
+
+### Headplane
+
+Headplane edits the file Headscale reads (`dns.extra_records_path`) unless `headscale.dns_records_path` points it elsewhere. Don't let it edit hs-hub's output: hs-hub would overwrite its changes, and Headplane only reads the file at startup, so it would write stale node records back. Give Headplane its own file and merge that instead:
+
+```yaml
+# Headplane's config.yaml
+headscale:
+  dns_records_path: /var/lib/headplane/dns-records.json
+```
+
+```
+hs-hub ... -static-records /var/lib/headplane/dns-records.json
+```
+
+Headplane only manages the file if it exists and holds valid JSON at startup, so create it containing `[]`. Headplane then shows and edits only the static records. Node records don't appear there.
+
 ## Failure behaviour
 
 | Situation | Effect |
@@ -74,6 +99,8 @@ hs-hub -output /var/lib/hs-hub/records.json -domain example.com \
 | `-manifest-port` | `7777` | Port of the manifest. |
 | `-manifest-path` | `/services.json` | HTTP path of the manifest. |
 | `-state` | | File persisting known nodes across restarts. |
+| `-static-records` | | Records file merged into the output. See [Static records](#static-records). |
+| `-static-interval` | `2s` | How often the static records file is checked for changes. |
 | `-interval` | `30s` | Time between rounds. `SIGHUP` triggers one immediately. |
 | `-grace` | `10m` | How long names of unreachable nodes are kept. |
 | `-fetch-timeout` | `3s` | Timeout per manifest fetch. |
@@ -115,6 +142,23 @@ The module runs the hub as a hardened service, creates an empty records file at 
 ```
 
 With an impermanent root, persist `/var/lib/hs-hub`.
+
+To merge records managed in Headplane, whose NixOS module runs it as the Headscale user:
+
+```nix
+let
+  dnsRecords = "/var/lib/headplane/dns-records.json";
+in
+{
+  services.headplane.settings.headscale.dns_records_path = dnsRecords;
+  services.hs-hub.staticRecordsFile = dnsRecords;
+
+  # Headplane needs the file to exist before it starts.
+  systemd.tmpfiles.rules = [
+    "f ${dnsRecords} 0644 ${config.services.headscale.user} ${config.services.headscale.group} - []"
+  ];
+}
+```
 
 ### Publishing services
 
